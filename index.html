@@ -1,4 +1,94 @@
-const readProvider = new ethers.JsonRpcProvider("https://mainnet.base.org");
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GM GN on Base</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px 16px 48px; font-family: Arial, Helvetica, sans-serif; background: #e8f0ff; color: #0f172a; }
+  .wrap { max-width: 480px; margin: 0 auto; }
+  h1 { text-align: center; margin: 8px 0 4px; font-size: 28px; }
+  .sub { text-align: center; color: #4a5878; margin: 0 0 20px; }
+  .card { background: #ffffff; border: 1px solid #c9d8f7; border-radius: 16px; padding: 20px; margin-bottom: 16px; box-shadow: 0 4px 16px rgba(0, 82, 255, 0.08); }
+  .card h2 { margin: 0 0 14px; font-size: 16px; color: #4a5878; font-weight: 600; }
+  .center { text-align: center; }
+  button { font-size: 17px; padding: 14px 28px; border: none; border-radius: 12px; cursor: pointer; color: #ffffff; background: linear-gradient(135deg, #0052ff, #5b8cff); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-row { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .btn-row button { flex: 1; min-width: 130px; }
+  #account { margin-top: 12px; font-size: 14px; color: #4a5878; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .stat { text-align: center; }
+  .num { font-size: 30px; font-weight: bold; color: #0052ff; }
+  .label { font-size: 13px; color: #4a5878; }
+  #status { min-height: 22px; text-align: center; word-break: break-all; font-size: 14px; }
+  #status.ok { color: #16a34a; }
+  #status.pending { color: #d97706; }
+  #status.err { color: #dc2626; }
+  a { color: #0041cc; }
+  .row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #c9d8f7; font-size: 15px; }
+  .row:last-child { border-bottom: none; }
+  .row.me { font-weight: bold; color: #0052ff; }
+  .muted { color: #4a5878; font-size: 14px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>GM / GN on Base</h1>
+  <p class="sub">Say GM or GN onchain</p>
+
+  <div class="card center">
+    <button id="connectBtn">Connect Wallet</button>
+    <div id="account"></div>
+    <div class="btn-row" style="margin-top:16px;">
+      <button id="gmBtn" disabled>Say GM</button>
+      <button id="gnBtn" disabled>Say GN</button>
+    </div>
+    <div class="grid" style="margin-top:20px;">
+      <div class="stat"><div class="num" id="myGm">-</div><div class="label">Your GM</div></div>
+      <div class="stat"><div class="num" id="myGn">-</div><div class="label">Your GN</div></div>
+    </div>
+    <div id="status" style="margin-top:14px;"></div>
+  </div>
+
+  <div class="card">
+    <h2>Global stats</h2>
+    <div class="grid">
+      <div class="stat"><div class="num" id="totalGm">-</div><div class="label">Total GM</div></div>
+      <div class="stat"><div class="num" id="totalGn">-</div><div class="label">Total GN</div></div>
+    </div>
+    <div class="stat" style="margin-top:16px;"><div class="num" id="totalUsers">-</div><div class="label">Unique users</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Leaderboard (top 5 GM)</h2>
+    <div id="board" class="muted">Loading...</div>
+  </div>
+
+  <p class="muted"><a id="contractLink" target="_blank">View contract on Basescan</a></p>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
+<script>
+  const CONTRACT_ADDRESS = "0xC26B5505630163c96C0aB9a584d990ABe4F63AAa".toLowerCase();
+  const DEPLOY_BLOCK = 0;
+  const STEP = 5000;
+  const BASE_CHAIN_ID = "0x2105";
+  const ABI = [
+    "function sayGM()",
+    "function sayGN()",
+    "function gmCount(address) view returns (uint256)",
+    "function gnCount(address) view returns (uint256)",
+    "event GMSent(address indexed user, uint256 time)",
+    "event GNSent(address indexed user, uint256 time)"
+  ];
+
+  const $ = (id) => document.getElementById(id);
+  const setStatus = (msg, cls) => { $("status").innerHTML = msg; $("status").className = cls || ""; };
+  $("contractLink").href = "https://basescan.org/address/" + CONTRACT_ADDRESS;
+
+  const readProvider = new ethers.JsonRpcProvider("https://mainnet.base.org");
   const readContract = new ethers.Contract(CONTRACT_ADDRESS, ABI, readProvider);
   let provider, signer, contract, userAddress;
 
@@ -92,10 +182,11 @@ const readProvider = new ethers.JsonRpcProvider("https://mainnet.base.org");
       setStatus("Failed: " + (err.shortMessage || err.message), "err");
     }
   }
-   $("connectBtn").onclick = connect;
+
+  $("connectBtn").onclick = connect;
   $("gmBtn").onclick = () => send("sayGM");
   $("gnBtn").onclick = () => send("sayGN");
   loadStats();
 </script>
 </body>
-</html>     
+</html>
