@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GM GN on Base</title>
+<style>
+  body { font-family: Arial, sans-serif; background: #0b0b14; color: #fff; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; text-align: center; }
+  h1 { margin-bottom: 8px; }
+  p { color: #9aa0b4; }
+  button { font-size: 18px; padding: 14px 32px; margin: 8px; border: none; border-radius: 12px; cursor: pointer; background: #0052ff; color: #fff; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  #status { margin-top: 20px; min-height: 24px; word-break: break-all; }
+  .stats { margin-top: 16px; font-size: 18px; }
+  a { color: #5b9bff; }
+</style>
+</head>
+<body>
+  <h1>GM / GN on Base</h1>
+  <p>Say GM or GN onchain</p>
+
+  <button id="connectBtn">Connect Wallet</button>
+  <div id="account"></div>
+
+  <div>
+    <button id="gmBtn" disabled>Say GM</button>
+    <button id="gnBtn" disabled>Say GN</button>
+  </div>
+
+  <div class="stats">
+    <div>Your GM: <span id="gmCount">-</span></div>
+    <div>Your GN: <span id="gnCount">-</span></div>
+  </div>
+
+  <div id="status"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
+  <script>
+    const CONTRACT_ADDRESS = "0xC26B5505630163c96C0aB9a584d990ABe4F63AAa".toLowerCase();
+    const BASE_CHAIN_ID = "0x2105";
+    const ABI = [
+      "function sayGM()",
+      "function sayGN()",
+      "function gmCount(address) view returns (uint256)",
+      "function gnCount(address) view returns (uint256)"
+    ];
+
+    let provider, signer, contract, userAddress;
+    const $ = (id) => document.getElementById(id);
+    const setStatus = (msg) => { $("status").innerHTML = msg; };
+
+    async function switchToBase() {
+      try {
+        await window.ethereum.request({
+          method: "wallet_switchEthereumChain",
+          params: [{ chainId: BASE_CHAIN_ID }]
+        });
+      } catch (err) {
+        if (err.code === 4902) {
+          await window.ethereum.request({
+            method: "wallet_addEthereumChain",
+            params: [{
+              chainId: BASE_CHAIN_ID,
+              chainName: "Base Mainnet",
+              nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+              rpcUrls: ["https://mainnet.base.org"],
+              blockExplorerUrls: ["https://basescan.org"]
+            }]
+          });
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    async function connect() {
+      if (!window.ethereum) {
+        setStatus("MetaMask not found. Please install it first.");
+        return;
+      }
+      try {
+        await window.ethereum.request({ method: "eth_requestAccounts" });
+        await switchToBase();
+        provider = new ethers.BrowserProvider(window.ethereum);
+        signer = await provider.getSigner();
+        userAddress = await signer.getAddress();
+        contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
+
+        $("account").textContent = "Connected: " + userAddress.slice(0, 6) + "..." + userAddress.slice(-4);
+        $("connectBtn").style.display = "none";
+        $("gmBtn").disabled = false;
+        $("gnBtn").disabled = false;
+        setStatus("");
+        await loadCounts();
+      } catch (err) {
+        setStatus("Connection failed: " + (err.shortMessage || err.message));
+      }
+    }
+
+    async function loadCounts() {
+      try {
+        $("gmCount").textContent = (await contract.gmCount(userAddress)).toString();
+        $("gnCount").textContent = (await contract.gnCount(userAddress)).toString();
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function send(fnName) {
+      try {
+        setStatus("Confirm the transaction in your wallet...");
+        const tx = await contract[fnName]();
+        setStatus('Pending... <a href="https://basescan.org/tx/' + tx.hash + '" target="_blank">View on Basescan</a>');
+        await tx.wait();
+        setStatus('Done! <a href="https://basescan.org/tx/' + tx.hash + '" target="_blank">View on Basescan</a>');
+        await loadCounts();
+      } catch (err) {
+        setStatus("Failed: " + (err.shortMessage || err.message));
+      }
+    }
+
+    $("connectBtn").onclick = connect;
+    $("gmBtn").onclick = () => send("sayGM");
+    $("gnBtn").onclick = () => send("sayGN");
+  </script>
+</body>
+</html>
