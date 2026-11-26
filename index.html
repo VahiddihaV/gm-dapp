@@ -32,6 +32,11 @@
   .row:last-child { border-bottom: none; }
   .row.me { font-weight: bold; color: #0052ff; }
   .muted { color: #4a5878; font-size: 14px; text-align: center; }
+  .modal { position: fixed; inset: 0; background: rgba(15, 23, 42, 0.5); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 10; }
+  .modal-card { background: #ffffff; border-radius: 16px; padding: 20px; width: 100%; max-width: 360px; text-align: center; }
+  .modal-card h2 { margin: 0 0 14px; font-size: 18px; color: #0f172a; }
+  .wallet-btn { display: flex; align-items: center; gap: 12px; width: 100%; margin-bottom: 8px; padding: 12px 14px; font-size: 16px; text-align: left; background: #ffffff; color: #0f172a; border: 1px solid #c9d8f7; }
+  .wallet-btn img { width: 28px; height: 28px; border-radius: 6px; }
 </style>
 </head>
 <body>
@@ -71,6 +76,14 @@
   <p class="muted"><a id="contractLink" target="_blank">View contract on Basescan</a></p>
 </div>
 
+<div id="modal" class="modal" style="display:none;">
+  <div class="modal-card">
+    <h2>Choose wallet</h2>
+    <div id="walletList"></div>
+    <button id="closeModal" class="secondary">Cancel</button>
+  </div>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
 <script>
   const CONTRACT_ADDRESS = "0xC26B5505630163c96C0aB9a584d990ABe4F63AAa".toLowerCase();
@@ -95,6 +108,7 @@
   const CHUNK = 9000;
   const PARALLEL = 4;
   const CACHE_KEY = "gmgn_stats_v2_" + DEPLOY_BLOCK + "_" + CONTRACT_ADDRESS;
+  const WALLET_KEY = "gmgn_last_wallet";
 
   const $ = (id) => document.getElementById(id);
   const setStatus = (msg, cls) => { $("status").innerHTML = msg; $("status").className = cls || ""; };
@@ -102,8 +116,50 @@
 
   const readProvider = new ethers.JsonRpcProvider(RPCS[0]);
   const readContract = new ethers.Contract(CONTRACT_ADDRESS, ABI, readProvider);
+  let walletProvider = null;
   let provider, signer, contract, userAddress;
 
+  /* ---------- wallet discovery (EIP-6963) ---------- */
+  const wallets = [];
+  function addWallet(detail) {
+    if (!detail || !detail.info || !detail.provider) return;
+    if (wallets.some((w) => w.info.uuid === detail.info.uuid)) return;
+    wallets.push(detail);
+  }
+  window.addEventListener("eip6963:announceProvider", (e) => addWallet(e.detail));
+  window.dispatchEvent(new Event("eip6963:requestProvider"));
+
+  function getWalletList() {
+    if (wallets.length > 0) return wallets;
+    if (window.ethereum) {
+      return [{ info: { name: "Browser wallet", icon: "", rdns: "injected", uuid: "injected" }, provider: window.ethereum }];
+    }
+    return [];
+  }
+  const walletId = (w) => w.info.rdns || w.info.name;
+
+  function openModal(list) {
+    const box = $("walletList");
+    box.innerHTML = "";
+    list.forEach((w) => {
+      const btn = document.createElement("button");
+      btn.className = "wallet-btn";
+      if (w.info.icon && String(w.info.icon).indexOf("data:image") === 0) {
+        const img = document.createElement("img");
+        img.src = w.info.icon;
+        btn.appendChild(img);
+      }
+      const name = document.createElement("span");
+      name.textContent = w.info.name;
+      btn.appendChild(name);
+      btn.onclick = () => connectWith(w);
+      box.appendChild(btn);
+    });
+    $("modal").style.display = "flex";
+  }
+  function closeModal() { $("modal").style.display = "none"; }
+
+  /* ---------- stats ---------- */
   let statsData = { lastBlock: null, gmTotal: 0, gnTotal: 0, gmMap: {}, users: {} };
   let statsRunning = false;
 
@@ -189,12 +245,13 @@
     statsRunning = false;
   }
 
+  /* ---------- wallet connection ---------- */
   async function switchToBase() {
     try {
-      await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: BASE_CHAIN_ID }] });
+      await walletProvider.request({ method: "wallet_switchEthereumChain", params: [{ chainId: BASE_CHAIN_ID }] });
     } catch (err) {
       if (err.code === 4902) {
-        await window.ethereum.request({
+        await walletProvider.request({
           method: "wallet_addEthereumChain",
           params: [{
             chainId: BASE_CHAIN_ID,
@@ -205,6 +262,25 @@
           }]
         });
       } else { throw err; }
+    }
+  }
+
+  function onAccountsChanged(accounts) {
+    if (!accounts || accounts.length === 0) resetUI();
+    else setupAccount().catch(console.error);
+  }
+  function onChainChanged() { window.location.reload(); }
+
+  function attachListeners() {
+    if (walletProvider && walletProvider.on) {
+      walletProvider.on("accountsChanged", onAccountsChanged);
+      walletProvider.on("chainChanged", onChainChanged);
+    }
+  }
+  function detachListeners() {
+    if (walletProvider && walletProvider.removeListener) {
+      walletProvider.removeListener("accountsChanged", onAccountsChanged);
+      walletProvider.removeListener("chainChanged", onChainChanged);
     }
   }
 
@@ -225,7 +301,7 @@
   }
 
   async function setupAccount() {
-    provider = new ethers.BrowserProvider(window.ethereum);
+    provider = new ethers.BrowserProvider(walletProvider);
     signer = await provider.getSigner();
     userAddress = await signer.getAddress();
     contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, signer);
@@ -239,35 +315,57 @@
     await loadMyCounts();
   }
 
-  async function connect() {
-    if (!window.ethereum) { setStatus("MetaMask not found. Please install it first.", "err"); return; }
+  async function connectWith(w) {
+    closeModal();
     try {
-      await window.ethereum.request({ method: "eth_requestAccounts" });
+      detachListeners();
+      walletProvider = w.provider;
+      await walletProvider.request({ method: "eth_requestAccounts" });
       await switchToBase();
+      attachListeners();
       await setupAccount();
+      try { localStorage.setItem(WALLET_KEY, walletId(w)); } catch (e) {}
     } catch (err) {
+      walletProvider = null;
       setStatus("Connection failed: " + (err.shortMessage || err.message), "err");
     }
   }
 
+  function connect() {
+    const list = getWalletList();
+    if (list.length === 0) { setStatus("No wallet found. Please install a wallet extension first.", "err"); return; }
+    if (list.length === 1) { connectWith(list[0]); return; }
+    openModal(list);
+  }
+
   async function disconnectWallet() {
     try {
-      await window.ethereum.request({
+      await walletProvider.request({
         method: "wallet_revokePermissions",
         params: [{ eth_accounts: {} }]
       });
     } catch (err) {
       console.error(err);
     }
+    detachListeners();
+    walletProvider = null;
+    try { localStorage.removeItem(WALLET_KEY); } catch (e) {}
     resetUI();
   }
 
   async function autoConnect() {
-    if (!window.ethereum) return;
+    await new Promise((r) => setTimeout(r, 400));
+    let saved = null;
+    try { saved = localStorage.getItem(WALLET_KEY); } catch (e) {}
+    if (!saved) return;
+    const w = getWalletList().find((x) => walletId(x) === saved);
+    if (!w) return;
     try {
-      const accounts = await window.ethereum.request({ method: "eth_accounts" });
-      const chainId = await window.ethereum.request({ method: "eth_chainId" });
+      const accounts = await w.provider.request({ method: "eth_accounts" });
+      const chainId = await w.provider.request({ method: "eth_chainId" });
       if (accounts.length > 0 && chainId === BASE_CHAIN_ID) {
+        walletProvider = w.provider;
+        attachListeners();
         await setupAccount();
       }
     } catch (err) {
@@ -286,7 +384,7 @@
     try {
       setStatus("Opening wallet...", "pending");
       const data = contract.interface.encodeFunctionData(fnName);
-      const hash = await window.ethereum.request({
+      const hash = await walletProvider.request({
         method: "eth_sendTransaction",
         params: [{ from: userAddress, to: CONTRACT_ADDRESS, data: data }]
       });
@@ -302,19 +400,10 @@
 
   $("connectBtn").onclick = connect;
   $("disconnectBtn").onclick = disconnectWallet;
+  $("closeModal").onclick = closeModal;
+  $("modal").onclick = (e) => { if (e.target === $("modal")) closeModal(); };
   $("gmBtn").onclick = () => send("sayGM");
   $("gnBtn").onclick = () => send("sayGN");
-
-  if (window.ethereum) {
-    window.ethereum.on("accountsChanged", (accounts) => {
-      if (accounts.length === 0) {
-        resetUI();
-      } else {
-        setupAccount().catch(console.error);
-      }
-    });
-    window.ethereum.on("chainChanged", () => window.location.reload());
-  }
 
   loadStats();
   autoConnect();
