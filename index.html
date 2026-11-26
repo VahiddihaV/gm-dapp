@@ -90,6 +90,12 @@
     "https://base.drpc.org"
   ];
 
+  const TOPIC_GM = ethers.id("GMSent(address,uint256)");
+  const TOPIC_GN = ethers.id("GNSent(address,uint256)");
+  const CHUNK = 9000;
+  const PARALLEL = 4;
+  const CACHE_KEY = "gmgn_stats_" + DEPLOY_BLOCK + "_" + CONTRACT_ADDRESS;
+
   const $ = (id) => document.getElementById(id);
   const setStatus = (msg, cls) => { $("status").innerHTML = msg; $("status").className = cls || ""; };
   $("contractLink").href = "https://basescan.org/address/" + CONTRACT_ADDRESS;
@@ -97,6 +103,91 @@
   const readProvider = new ethers.JsonRpcProvider(RPCS[0]);
   const readContract = new ethers.Contract(CONTRACT_ADDRESS, ABI, readProvider);
   let provider, signer, contract, userAddress;
+
+  let statsData = { lastBlock: null, gmTotal: 0, gnTotal: 0, gmMap: {}, users: {} };
+  let statsRunning = false;
+
+  function loadCache() {
+    try {
+      const raw = localStorage.getItem(CACHE_KEY);
+      if (raw) return JSON.parse(raw);
+    } catch (e) {}
+    return null;
+  }
+
+  function saveCache(data) {
+    try { localStorage.setItem(CACHE_KEY, JSON.stringify(data)); } catch (e) {}
+  }
+
+  function renderStats(data) {
+    if (data.lastBlock === null) return;
+    $("totalGm").textContent = data.gmTotal;
+    $("totalGn").textContent = data.gnTotal;
+    $("totalUsers").textContent = Object.keys(data.users).length;
+    const top = Object.entries(data.gmMap).sort((a, b) => b[1] - a[1]).slice(0, 5);
+    if (top.length === 0) { $("board").className = "muted"; $("board").textContent = "No GM yet. Be the first."; return; }
+    $("board").className = "";
+    $("board").innerHTML = top.map((e, i) => {
+      const me = userAddress && e[0] === userAddress.toLowerCase() ? " me" : "";
+      return '<div class="row' + me + '"><span>' + (i + 1) + ". " + e[0].slice(0, 6) + "..." + e[0].slice(-4) + "</span><span>" + e[1] + "</span></div>";
+    }).join("");
+  }
+
+  async function scanRange(p, from, to, data) {
+    const ranges = [];
+    for (let s = from; s <= to; s += CHUNK) ranges.push([s, Math.min(s + CHUNK - 1, to)]);
+    for (let i = 0; i < ranges.length; i += PARALLEL) {
+      const batch = ranges.slice(i, i + PARALLEL);
+      const results = await Promise.all(batch.map((r) => p.getLogs({
+        address: CONTRACT_ADDRESS,
+        fromBlock: r[0],
+        toBlock: r[1],
+        topics: [[TOPIC_GM, TOPIC_GN]]
+      })));
+      results.forEach((logs) => logs.forEach((l) => {
+        const user = ("0x" + l.topics[1].slice(26)).toLowerCase();
+        data.users[user] = true;
+        if (l.topics[0] === TOPIC_GM) {
+          data.gmTotal++;
+          data.gmMap[user] = (data.gmMap[user] || 0) + 1;
+        } else {
+          data.gnTotal++;
+        }
+      }));
+      data.lastBlock = batch[batch.length - 1][1];
+      saveCache(data);
+      renderStats(data);
+    }
+  }
+
+  async function loadStats() {
+    if (statsRunning) { renderStats(statsData); return; }
+    statsRunning = true;
+    const cached = loadCache();
+    if (cached) statsData = cached;
+    renderStats(statsData);
+
+    let ok = false;
+    for (const rpc of RPCS) {
+      try {
+        const p = new ethers.JsonRpcProvider(rpc);
+        const latest = await p.getBlockNumber();
+        let from;
+        if (statsData.lastBlock !== null) from = statsData.lastBlock + 1;
+        else from = DEPLOY_BLOCK > 0 ? DEPLOY_BLOCK : Math.max(latest - 100000, 0);
+        if (from <= latest) await scanRange(p, from, latest, statsData);
+        else renderStats(statsData);
+        ok = true;
+        break;
+      } catch (err) {
+        console.error(rpc, err);
+      }
+    }
+    if (!ok && statsData.lastBlock === null) {
+      $("board").textContent = "Could not load stats right now.";
+    }
+    statsRunning = false;
+  }
 
   async function switchToBase() {
     try {
@@ -130,7 +221,7 @@
     $("myGm").textContent = "-";
     $("myGn").textContent = "-";
     setStatus("");
-    loadStats();
+    renderStats(statsData);
   }
 
   async function setupAccount() {
@@ -144,8 +235,8 @@
     $("gmBtn").disabled = false;
     $("gnBtn").disabled = false;
     setStatus("");
+    renderStats(statsData);
     await loadMyCounts();
-    loadStats();
   }
 
   async function connect() {
@@ -191,51 +282,6 @@
     } catch (err) { console.error(err); }
   }
 
-  async function fetchLogs(rpc, start, latest) {
-    const p = new ethers.JsonRpcProvider(rpc);
-    const c = new ethers.Contract(CONTRACT_ADDRESS, ABI, p);
-    const gm = [], gn = [];
-    for (let from = start; from <= latest; from += 9000) {
-      const to = Math.min(from + 8999, latest);
-      gm.push(...await c.queryFilter("GMSent", from, to));
-      gn.push(...await c.queryFilter("GNSent", from, to));
-    }
-    return { gm, gn };
-  }
-
-  async function loadStats() {
-    let result = null;
-    for (const rpc of RPCS) {
-      try {
-        const p = new ethers.JsonRpcProvider(rpc);
-        const latest = await p.getBlockNumber();
-        const start = DEPLOY_BLOCK > 0 ? DEPLOY_BLOCK : Math.max(latest - 100000, 0);
-        result = await fetchLogs(rpc, start, latest);
-        break;
-      } catch (err) {
-        console.error(rpc, err);
-      }
-    }
-    if (!result) { $("board").textContent = "Could not load stats right now."; return; }
-
-    const gmMap = {};
-    const users = new Set();
-    result.gm.forEach((l) => { const u = l.args[0].toLowerCase(); gmMap[u] = (gmMap[u] || 0) + 1; users.add(u); });
-    result.gn.forEach((l) => { users.add(l.args[0].toLowerCase()); });
-
-    $("totalGm").textContent = result.gm.length;
-    $("totalGn").textContent = result.gn.length;
-    $("totalUsers").textContent = users.size;
-
-    const top = Object.entries(gmMap).sort((a, b) => b[1] - a[1]).slice(0, 5);
-    if (top.length === 0) { $("board").textContent = "No GM yet. Be the first."; return; }
-    $("board").className = "";
-    $("board").innerHTML = top.map((e, i) => {
-      const me = userAddress && e[0] === userAddress.toLowerCase() ? " me" : "";
-      return '<div class="row' + me + '"><span>' + (i + 1) + ". " + e[0].slice(0, 6) + "..." + e[0].slice(-4) + "</span><span>" + e[1] + "</span></div>";
-    }).join("");
-  }
-
   async function send(fnName) {
     try {
       setStatus("Confirm the transaction in your wallet...", "pending");
@@ -266,7 +312,8 @@
     window.ethereum.on("chainChanged", () => window.location.reload());
   }
 
-  autoConnect().then(() => { if (!userAddress) loadStats(); });
+  loadStats();
+  autoConnect();
 </script>
 </body>
 </html>
