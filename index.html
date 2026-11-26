@@ -94,7 +94,7 @@
   const TOPIC_GN = ethers.id("GNSent(address,uint256)");
   const CHUNK = 9000;
   const PARALLEL = 4;
-  const CACHE_KEY = "gmgn_stats_" + DEPLOY_BLOCK + "_" + CONTRACT_ADDRESS;
+  const CACHE_KEY = "gmgn_stats_v2_" + DEPLOY_BLOCK + "_" + CONTRACT_ADDRESS;
 
   const $ = (id) => document.getElementById(id);
   const setStatus = (msg, cls) => { $("status").innerHTML = msg; $("status").className = cls || ""; };
@@ -284,11 +284,15 @@
 
   async function send(fnName) {
     try {
-      setStatus("Confirm the transaction in your wallet...", "pending");
-      const tx = await contract[fnName]();
-      setStatus('Pending... <a href="https://basescan.org/tx/' + tx.hash + '" target="_blank">View on Basescan</a>', "pending");
-      await tx.wait();
-      setStatus('Done! <a href="https://basescan.org/tx/' + tx.hash + '" target="_blank">View on Basescan</a>', "ok");
+      setStatus("Opening wallet...", "pending");
+      const data = contract.interface.encodeFunctionData(fnName);
+      const hash = await window.ethereum.request({
+        method: "eth_sendTransaction",
+        params: [{ from: userAddress, to: CONTRACT_ADDRESS, data: data }]
+      });
+      setStatus('Pending... <a href="https://basescan.org/tx/' + hash + '" target="_blank">View on Basescan</a>', "pending");
+      await readProvider.waitForTransaction(hash);
+      setStatus('Done! <a href="https://basescan.org/tx/' + hash + '" target="_blank">View on Basescan</a>', "ok");
       await loadMyCounts();
       loadStats();
     } catch (err) {
