@@ -72,8 +72,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
 <script>
   const CONTRACT_ADDRESS = "0xC26B5505630163c96C0aB9a584d990ABe4F63AAa".toLowerCase();
-  const DEPLOY_BLOCK = 61813040;
-  const STEP = 5000;
+  const DEPLOY_BLOCK = 0;
   const BASE_CHAIN_ID = "0x2105";
   const ABI = [
     "function sayGM()",
@@ -83,12 +82,17 @@
     "event GMSent(address indexed user, uint256 time)",
     "event GNSent(address indexed user, uint256 time)"
   ];
+  const RPCS = [
+    "https://base-rpc.publicnode.com",
+    "https://mainnet.base.org",
+    "https://base.drpc.org"
+  ];
 
   const $ = (id) => document.getElementById(id);
   const setStatus = (msg, cls) => { $("status").innerHTML = msg; $("status").className = cls || ""; };
   $("contractLink").href = "https://basescan.org/address/" + CONTRACT_ADDRESS;
 
-  const readProvider = new ethers.JsonRpcProvider("https://mainnet.base.org");
+  const readProvider = new ethers.JsonRpcProvider(RPCS[0]);
   const readContract = new ethers.Contract(CONTRACT_ADDRESS, ABI, readProvider);
   let provider, signer, contract, userAddress;
 
@@ -139,34 +143,49 @@
     } catch (err) { console.error(err); }
   }
 
-  async function loadStats() {
-    try {
-      const latest = await readProvider.getBlockNumber();
-      const start = DEPLOY_BLOCK > 0 ? DEPLOY_BLOCK : Math.max(latest - 100000, 0);
-      const gm = {};
-      const users = new Set();
-      let gmTotal = 0, gnTotal = 0;
-      for (let from = start; from <= latest; from += STEP) {
-        const to = Math.min(from + STEP - 1, latest);
-        const gmLogs = await readContract.queryFilter("GMSent", from, to);
-        const gnLogs = await readContract.queryFilter("GNSent", from, to);
-        gmLogs.forEach((l) => { const u = l.args[0].toLowerCase(); gm[u] = (gm[u] || 0) + 1; users.add(u); gmTotal++; });
-        gnLogs.forEach((l) => { users.add(l.args[0].toLowerCase()); gnTotal++; });
-      }
-      $("totalGm").textContent = gmTotal;
-      $("totalGn").textContent = gnTotal;
-      $("totalUsers").textContent = users.size;
-      const top = Object.entries(gm).sort((a, b) => b[1] - a[1]).slice(0, 5);
-      if (top.length === 0) { $("board").textContent = "No GM yet. Be the first."; return; }
-      $("board").className = "";
-      $("board").innerHTML = top.map((e, i) => {
-        const me = userAddress && e[0] === userAddress.toLowerCase() ? " me" : "";
-        return '<div class="row' + me + '"><span>' + (i + 1) + ". " + e[0].slice(0, 6) + "..." + e[0].slice(-4) + "</span><span>" + e[1] + "</span></div>";
-      }).join("");
-    } catch (err) {
-      console.error(err);
-      $("board").textContent = "Could not load stats right now.";
+  async function fetchLogs(rpc, start, latest) {
+    const p = new ethers.JsonRpcProvider(rpc);
+    const c = new ethers.Contract(CONTRACT_ADDRESS, ABI, p);
+    const gm = [], gn = [];
+    for (let from = start; from <= latest; from += 9000) {
+      const to = Math.min(from + 8999, latest);
+      gm.push(...await c.queryFilter("GMSent", from, to));
+      gn.push(...await c.queryFilter("GNSent", from, to));
     }
+    return { gm, gn };
+  }
+
+  async function loadStats() {
+    let result = null;
+    for (const rpc of RPCS) {
+      try {
+        const p = new ethers.JsonRpcProvider(rpc);
+        const latest = await p.getBlockNumber();
+        const start = DEPLOY_BLOCK > 0 ? DEPLOY_BLOCK : Math.max(latest - 100000, 0);
+        result = await fetchLogs(rpc, start, latest);
+        break;
+      } catch (err) {
+        console.error(rpc, err);
+      }
+    }
+    if (!result) { $("board").textContent = "Could not load stats right now."; return; }
+
+    const gmMap = {};
+    const users = new Set();
+    result.gm.forEach((l) => { const u = l.args[0].toLowerCase(); gmMap[u] = (gmMap[u] || 0) + 1; users.add(u); });
+    result.gn.forEach((l) => { users.add(l.args[0].toLowerCase()); });
+
+    $("totalGm").textContent = result.gm.length;
+    $("totalGn").textContent = result.gn.length;
+    $("totalUsers").textContent = users.size;
+
+    const top = Object.entries(gmMap).sort((a, b) => b[1] - a[1]).slice(0, 5);
+    if (top.length === 0) { $("board").textContent = "No GM yet. Be the first."; return; }
+    $("board").className = "";
+    $("board").innerHTML = top.map((e, i) => {
+      const me = userAddress && e[0] === userAddress.toLowerCase() ? " me" : "";
+      return '<div class="row' + me + '"><span>' + (i + 1) + ". " + e[0].slice(0, 6) + "..." + e[0].slice(-4) + "</span><span>" + e[1] + "</span></div>";
+    }).join("");
   }
 
   async function send(fnName) {
