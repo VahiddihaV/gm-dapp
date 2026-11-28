@@ -21,6 +21,7 @@
   #account { margin-top: 12px; font-size: 14px; color: #4a5878; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .stat { text-align: center; }
+  .stat.full { grid-column: 1 / -1; }
   .num { font-size: 30px; font-weight: bold; color: #0052ff; }
   .num.sm { font-size: 20px; word-break: break-word; }
   .label { font-size: 13px; color: #4a5878; }
@@ -79,12 +80,11 @@
       <div class="grid">
         <div class="stat"><div class="num sm" id="sTx">-</div><div class="label">Total Transactions</div></div>
         <div class="stat"><div class="num sm" id="sGas">-</div><div class="label">Gas fees paid</div><div class="hint" id="sGasUsd"></div></div>
-        <div class="stat"><div class="num sm" id="sNft">-</div><div class="label">NFTs minted</div></div>
         <div class="stat"><div class="num sm" id="sBal">-</div><div class="label">Balance on Base</div><div class="hint" id="sBalUsd"></div></div>
         <div class="stat"><div class="num sm" id="sDays">-</div><div class="label">Active days</div></div>
         <div class="stat"><div class="num sm" id="sContracts">-</div><div class="label">Unique contracts</div></div>
         <div class="stat"><div class="num sm" id="sFirst">-</div><div class="label">First Transaction</div><div class="hint" id="sFirstAge"></div></div>
-        <div class="stat"><div class="num sm" id="sVol">-</div><div class="label">Total Volume (ETH sent)</div><div class="hint" id="sVolUsd"></div></div>
+        <div class="stat full"><div class="num sm" id="sVol">-</div><div class="label">Total Volume (ETH sent)</div><div class="hint" id="sVolUsd"></div></div>
       </div>
       <div class="hint center" id="scoreNote" style="margin-top:16px;"></div>
     </div>
@@ -434,12 +434,10 @@
   const BS_RPC = "https://base.blockscout.com/api";
   const RPC_PAGE = 10000;
   const MAX_RUN_PAGES = 400;
-  const MAX_PAGES_NFT = 100;
-  const PAGE_DELAY = 250;
+  const PAGE_DELAY = 100;
   const REQ_TIMEOUT = 25000;
   const SCORE_KEY = "gmgn_score_v1_";
   const FAST_KEY = "gmgn_fast_v1_";
-  const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const setWalletMsg = (msg, cls) => { $("walletMsg").textContent = msg; $("walletMsg").className = cls || ""; };
 
@@ -508,9 +506,9 @@
   };
   const fmtUsd = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-  /* --- fast scan state --- */
+  /* --- fast scan: counts, days, contracts, volume, first transaction --- */
   function newFast() {
-    return { lastBlock: -1, count: 0, feeExec: "0", vol: "0", days: [], contracts: [], firstAny: null, firstSent: null };
+    return { lastBlock: -1, count: 0, vol: "0", days: [], contracts: [], firstAny: null, firstSent: null };
   }
   function loadFast(addr) {
     try { const raw = localStorage.getItem(FAST_KEY + addr); if (raw) return JSON.parse(raw); } catch (e) {}
@@ -523,7 +521,6 @@
   async function fastScan(addr, fs, onProgress, alive) {
     const days = new Set(fs.days);
     const cons = new Set(fs.contracts);
-    let fee = toBig(fs.feeExec);
     let vol = toBig(fs.vol);
     let start = fs.lastBlock >= 0 ? fs.lastBlock + 1 : 0;
     let seen = new Set();
@@ -539,7 +536,6 @@
         if (fs.firstAny === null || ts < fs.firstAny) fs.firstAny = ts;
         if (String(t.from).toLowerCase() === addr) {
           fs.count++;
-          fee += toBig(t.gasUsed) * toBig(t.gasPrice);
           if (String(t.isError) === "0") vol += toBig(t.value);
           days.add(new Date(ts).toISOString().slice(0, 10));
           if (t.to && t.input && t.input !== "0x") cons.add(String(t.to).toLowerCase());
@@ -548,7 +544,6 @@
         if (b > maxB) maxB = b;
       });
 
-      fs.feeExec = fee.toString();
       fs.vol = vol.toString();
       fs.days = Array.from(days);
       fs.contracts = Array.from(cons);
@@ -564,7 +559,7 @@
     }
   }
 
-  /* --- exact scan (slower): also gives the real fee including the L1 data fee --- */
+  /* --- exact scan: real fee per transaction, including the L1 data fee --- */
   function newScore() {
     return { cursor: null, lastCur: null, done: false, stopped: false, markB: -1, markP: -1, count: 0, fee: "0", vol: "0", days: [], contracts: [], firstSent: null, firstAny: null };
   }
@@ -655,28 +650,6 @@
     }
   }
 
-  /* --- NFT mints (background) --- */
-  async function scanNfts(addr, onProgress, alive) {
-    let minted = 0, next = null, pages = 0, capped = false;
-    while (true) {
-      if (!alive()) return null;
-      const q = Object.assign({ type: "ERC-721,ERC-1155", filter: "to" }, next || {});
-      const d = await bsGet("/addresses/" + addr + "/token-transfers", q);
-      if (!d) break;
-      (d.items || []).forEach((t) => {
-        if (t.from && t.from.hash && t.from.hash.toLowerCase() === ZERO_ADDR &&
-            t.to && t.to.hash && t.to.hash.toLowerCase() === addr) minted++;
-      });
-      pages++;
-      onProgress(minted);
-      if (!d.next_page_params) break;
-      next = d.next_page_params;
-      if (pages >= MAX_PAGES_NFT) { capped = true; break; }
-      await sleep(PAGE_DELAY);
-    }
-    return { minted: minted, capped: capped };
-  }
-
   /* --- view state and rendering --- */
   const V = { addr: null };
   let currentRun = 0;
@@ -690,32 +663,25 @@
     const slowOnly = !f && !!s;
     const src = fastReady ? f : (slowOnly ? s : null);
     const plus = slowOnly && !s.done ? "+" : "";
-    const cnt = src ? src.count : 0;
 
-    if (V.nonce !== null) $("sTx").textContent = String(Math.max(V.nonce, cnt));
-    else $("sTx").textContent = src ? cnt + plus : "...";
+    $("sTx").textContent = src ? src.count + plus : "...";
 
     let gasTxt = "...", gasHint = "";
     if (s && s.done) {
       const w = toBig(s.fee);
       gasTxt = fmtEth(w, 6);
       gasHint = (usdOf(w) + " incl. L1 data fee").trim();
-    } else if (fastReady) {
-      const w = toBig(f.feeExec);
-      const pct = V.nonce && s ? Math.min(99, Math.floor((100 * s.count) / Math.max(V.nonce, 1))) : 0;
-      gasTxt = "~" + fmtEth(w, 6);
-      gasHint = (usdOf(w) + " execution fee, refining " + pct + "%").trim();
-    } else if (slowOnly) {
+    } else if (s && s.count > 0) {
       const w = toBig(s.fee);
+      const denom = fastReady ? f.count : (V.nonce || 0);
+      const pct = denom ? Math.min(99, Math.floor((100 * s.count) / denom)) : 0;
       gasTxt = fmtEth(w, 6) + "+";
-      gasHint = usdOf(w);
+      gasHint = (usdOf(w) + " so far, " + pct + "%").trim();
+    } else if (s) {
+      gasHint = "calculating...";
     }
     $("sGas").textContent = gasTxt;
     $("sGasUsd").textContent = gasHint;
-
-    if (V.nftFailed) $("sNft").textContent = "n/a";
-    else if (V.nft === null) $("sNft").textContent = "...";
-    else $("sNft").textContent = V.nft + (V.nftDone ? (V.nftCapped ? "+" : "") : "...");
 
     if (V.infoFailed) { $("sBal").textContent = "n/a"; $("sBalUsd").textContent = ""; }
     else if (V.hasInfo) {
@@ -733,10 +699,10 @@
       $("sFirst").textContent = "...";
       $("sFirstAge").textContent = "";
     } else {
-      let firstMs = null, sentMs = null;
+      let firstMs = null;
       const cand = [fastReady ? f.firstAny : null, fastReady ? f.firstSent : null, s ? s.firstAny : null, s ? s.firstSent : null];
       cand.forEach((x) => { if (x && (firstMs === null || x < firstMs)) firstMs = x; });
-      sentMs = fastReady ? f.firstSent : (s ? s.firstSent : null);
+      const sentMs = fastReady ? f.firstSent : (s ? s.firstSent : null);
       if (firstMs === null) { $("sFirst").textContent = "-"; $("sFirstAge").textContent = ""; }
       else {
         $("sFirst").textContent = dateOf(firstMs);
@@ -747,15 +713,16 @@
     }
 
     let note;
-    if (slowOnly && !s.done && !V.slowRunning) {
-      note = "Scanned " + s.count + " of ~" + (V.nonce || "?") + " sent transactions. Press Check again to continue.";
-    } else if (V.fastFailed) {
-      note = "The fast data source was unavailable, so the slower exact method was used.";
-    } else if (s && s.done) {
+    if (s && s.done) {
       note = "All numbers cover every sent transaction on Base since its first block. USD values use the current ETH price.";
+    } else if (s && s.stopped) {
+      note = "The connection was interrupted, so gas fees are partial. Press Check again to continue.";
+    } else if (slowOnly && !V.slowRunning) {
+      note = "Scanned " + s.count + " of ~" + (V.nonce || "?") + " sent transactions. Press Check again to continue.";
     } else {
-      note = "Everything except gas fees is already exact. Gas fees are a quick estimate that becomes exact in the background.";
+      note = "Gas fees are being calculated exactly, including the L1 data fee. The other numbers are final.";
     }
+    if (V.fastFailed) note = "The fast data source was unavailable, so the slower method is used and numbers marked + are still growing. " + note;
     $("scoreNote").textContent = note;
   }
 
@@ -798,37 +765,25 @@
       if (!alive()) return;
       V.fastFailed = true;
       V.fast = null;
-      setWalletMsg("Fast source unavailable, using the slower method...", "pending");
-      const st = loadScore(addr) || newScore();
-      V.slow = st;
-      V.slowRunning = true;
-      await scanSent(addr, st, (n) => {
-        if (alive()) { setWalletMsg("Scanning sent transactions: " + n + (V.nonce ? " of ~" + V.nonce : "") + "...", "pending"); render(); }
-      }, alive);
-      V.slowRunning = false;
-      try { await getFirstAny(addr, st); saveScore(addr, st); } catch (e2) { console.error(e2); }
-      if (alive()) render();
+      setWalletMsg("Fast source unavailable, using the slower method. Numbers will update as they load.", "pending");
+      render();
     }
   }
 
-  function startBackground(addr, alive) {
-    if (!(V.slow && V.slow.done) && !V.slowRunning) {
-      const st = V.slow || loadScore(addr) || newScore();
-      V.slow = st;
-      V.slowRunning = true;
-      scanSent(addr, st, () => { if (alive()) render(); }, alive)
-        .catch((e) => console.error(e))
-        .then(() => { V.slowRunning = false; if (alive()) render(); });
-    }
-    scanNfts(addr, (n) => { if (alive()) { V.nft = n; render(); } }, alive)
-      .then((res) => {
-        if (!alive() || !res) return;
-        V.nft = res.minted; V.nftCapped = res.capped; V.nftDone = true; render();
-      })
-      .catch((e) => {
-        console.error(e);
-        if (alive()) { V.nftFailed = true; render(); }
-      });
+  async function runExact(addr, alive) {
+    const st = loadScore(addr) || newScore();
+    V.slow = st;
+    V.slowRunning = true;
+    try {
+      await scanSent(addr, st, () => { if (alive()) render(); }, alive);
+      if (alive() && !st.firstAny) {
+        try { await getFirstAny(addr, st); saveScore(addr, st); } catch (e) { console.error(e); }
+      }
+    } catch (e) { console.error(e); }
+    if (!alive()) return;
+    V.slowRunning = false;
+    if (V.fastFailed) setWalletMsg("");
+    render();
   }
 
   async function checkWallet() {
@@ -842,8 +797,7 @@
     Object.assign(V, {
       addr: addr, price: 0, balWei: 0n, tokenUsd: 0, hasInfo: false, infoFailed: false,
       nonce: null, fast: null, fastDone: false, fastFailed: false,
-      slow: null, slowRunning: false,
-      nft: null, nftDone: false, nftCapped: false, nftFailed: false
+      slow: null, slowRunning: false
     });
 
     $("scoreBtn").disabled = true;
@@ -855,6 +809,7 @@
     const infoTask = loadInfo(addr, alive);
     const nonceTask = getNonce(addr).then((n) => { if (alive()) { V.nonce = n; render(); } }).catch(console.error);
     const fastTask = runFast(addr, alive);
+    runExact(addr, alive);
 
     try {
       await Promise.all([infoTask, nonceTask, fastTask]);
@@ -862,10 +817,9 @@
       if (alive()) setWalletMsg("Failed: " + (err.message || "unknown error"), "err");
     }
     if (!alive()) return;
-    if ($("walletMsg").className !== "err") setWalletMsg("");
+    if (!V.fastFailed) setWalletMsg("");
     $("scoreBtn").disabled = false;
     render();
-    startBackground(addr, alive);
   }
 
   $("connectBtn").onclick = connect;
