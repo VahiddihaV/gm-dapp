@@ -429,27 +429,28 @@
     }
   }
 
-  /* ---------- wallet activity score (Blockscout API) ---------- */
+  /* ---------- wallet activity score ---------- */
   const BS = "https://base.blockscout.com/api/v2";
-  const MAX_RUN_PAGES = 120;
-  const MAX_PAGES_NFT = 40;
-  const PAGE_DELAY = 300;
+  const BS_RPC = "https://base.blockscout.com/api";
+  const RPC_PAGE = 10000;
+  const MAX_RUN_PAGES = 400;
+  const MAX_PAGES_NFT = 100;
+  const PAGE_DELAY = 250;
   const REQ_TIMEOUT = 25000;
   const SCORE_KEY = "gmgn_score_v1_";
+  const FAST_KEY = "gmgn_fast_v1_";
   const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const setWalletMsg = (msg, cls) => { $("walletMsg").textContent = msg; $("walletMsg").className = cls || ""; };
 
-  /* Every request has a timeout and up to 6 retries with growing pauses. */
-  async function bsGet(path, params) {
-    const url = new URL(BS + path);
-    Object.keys(params || {}).forEach((k) => url.searchParams.set(k, params[k]));
+  /* One request with a timeout and up to 6 retries with growing pauses. */
+  async function httpJson(url) {
     let lastErr = null;
     for (let i = 0; i < 6; i++) {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), REQ_TIMEOUT);
       try {
-        const r = await fetch(url.toString(), { signal: ctrl.signal });
+        const r = await fetch(url, { signal: ctrl.signal });
         clearTimeout(timer);
         if (r.status === 404) return null;
         if (r.status === 429 || r.status >= 500) {
@@ -464,26 +465,27 @@
         if (e && e.message && e.message.indexOf("API error") === 0) throw e;
         lastErr = e;
       }
-      setWalletMsg("Connection slow, retrying (" + (i + 1) + "/6)...", "pending");
-      await sleep(Math.min(2000 * (i + 1), 10000));
+      await sleep(Math.min(1500 * (i + 1), 8000));
     }
-    throw new Error("Could not reach the data source (" + (lastErr && lastErr.message ? lastErr.message : "network error") + "). Check your VPN or internet and press Check again.");
+    throw new Error("Could not reach the data source (" + (lastErr && lastErr.message ? lastErr.message : "network error") + "). Check your VPN or internet.");
   }
 
-  async function bsPages(path, params, maxPages, onProgress) {
-    let items = [];
-    let next = null;
-    for (let p = 0; p < maxPages; p++) {
-      const q = Object.assign({}, params, next || {});
-      const d = await bsGet(path, q);
-      if (!d) return { items: items, capped: false };
-      items = items.concat(d.items || []);
-      if (onProgress) onProgress(items.length);
-      if (!d.next_page_params) return { items: items, capped: false };
-      next = d.next_page_params;
-      await sleep(PAGE_DELAY);
-    }
-    return { items: items, capped: true };
+  async function bsGet(path, params) {
+    const url = new URL(BS + path);
+    Object.keys(params || {}).forEach((k) => url.searchParams.set(k, params[k]));
+    return httpJson(url.toString());
+  }
+
+  /* Fast source: up to 10,000 transactions per request (sent and received). */
+  async function rpcTxlist(addr, start) {
+    const url = new URL(BS_RPC);
+    const q = { module: "account", action: "txlist", address: addr, startblock: start, endblock: 99999999, page: 1, offset: RPC_PAGE, sort: "asc" };
+    Object.keys(q).forEach((k) => url.searchParams.set(k, q[k]));
+    const d = await httpJson(url.toString());
+    if (!d) return [];
+    if (Array.isArray(d.result)) return d.result;
+    if (String(d.message || "").toLowerCase().indexOf("no transactions") >= 0) return [];
+    throw new Error("Unexpected response: " + (d.message || "unknown"));
   }
 
   async function getNonce(addr) {
@@ -506,24 +508,75 @@
   };
   const fmtUsd = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
+  /* --- fast scan state --- */
+  function newFast() {
+    return { lastBlock: -1, count: 0, feeExec: "0", vol: "0", days: [], contracts: [], firstAny: null, firstSent: null };
+  }
+  function loadFast(addr) {
+    try { const raw = localStorage.getItem(FAST_KEY + addr); if (raw) return JSON.parse(raw); } catch (e) {}
+    return null;
+  }
+  function saveFast(addr, fs) {
+    try { localStorage.setItem(FAST_KEY + addr, JSON.stringify(fs)); } catch (e) {}
+  }
+
+  async function fastScan(addr, fs, onProgress, alive) {
+    const days = new Set(fs.days);
+    const cons = new Set(fs.contracts);
+    let fee = toBig(fs.feeExec);
+    let vol = toBig(fs.vol);
+    let start = fs.lastBlock >= 0 ? fs.lastBlock + 1 : 0;
+    let seen = new Set();
+
+    while (true) {
+      if (!alive()) return;
+      const list = await rpcTxlist(addr, start);
+      let maxB = start;
+      list.forEach((t) => {
+        const b = parseInt(t.blockNumber, 10);
+        if (b === start && seen.has(t.hash)) return;
+        const ts = parseInt(t.timeStamp, 10) * 1000;
+        if (fs.firstAny === null || ts < fs.firstAny) fs.firstAny = ts;
+        if (String(t.from).toLowerCase() === addr) {
+          fs.count++;
+          fee += toBig(t.gasUsed) * toBig(t.gasPrice);
+          if (String(t.isError) === "0") vol += toBig(t.value);
+          days.add(new Date(ts).toISOString().slice(0, 10));
+          if (t.to && t.input && t.input !== "0x") cons.add(String(t.to).toLowerCase());
+          if (fs.firstSent === null || ts < fs.firstSent) fs.firstSent = ts;
+        }
+        if (b > maxB) maxB = b;
+      });
+
+      fs.feeExec = fee.toString();
+      fs.vol = vol.toString();
+      fs.days = Array.from(days);
+      fs.contracts = Array.from(cons);
+      if (maxB > fs.lastBlock) fs.lastBlock = maxB;
+      saveFast(addr, fs);
+      onProgress(fs.count);
+
+      if (list.length < RPC_PAGE) break;
+      if (maxB <= start) break;
+      seen = new Set();
+      list.forEach((t) => { if (parseInt(t.blockNumber, 10) === maxB) seen.add(t.hash); });
+      start = maxB;
+    }
+  }
+
+  /* --- exact scan (slower): also gives the real fee including the L1 data fee --- */
   function newScore() {
     return { cursor: null, lastCur: null, done: false, stopped: false, markB: -1, markP: -1, count: 0, fee: "0", vol: "0", days: [], contracts: [], firstSent: null, firstAny: null };
   }
   function loadScore(addr) {
-    try {
-      const raw = localStorage.getItem(SCORE_KEY + addr);
-      if (raw) return JSON.parse(raw);
-    } catch (e) {}
+    try { const raw = localStorage.getItem(SCORE_KEY + addr); if (raw) return JSON.parse(raw); } catch (e) {}
     return null;
   }
   function saveScore(addr, st) {
     try { localStorage.setItem(SCORE_KEY + addr, JSON.stringify(st)); } catch (e) {}
   }
 
-  /* Scans sent transactions from oldest to newest and keeps running totals.
-     Progress is saved, so a repeat check only reads new transactions,
-     and an interrupted or very large scan continues where it stopped. */
-  async function scanSent(addr, st, onProgress) {
+  async function scanSent(addr, st, onProgress, alive) {
     const days = new Set(st.days);
     const cons = new Set(st.contracts);
     let fee = toBig(st.fee);
@@ -542,6 +595,7 @@
     };
 
     while (true) {
+      if (!alive()) { commit(); return; }
       const q = Object.assign({ filter: "from", sort: "block_number", order: "asc" }, cur || {});
       let d;
       try {
@@ -587,7 +641,6 @@
     commit();
   }
 
-  /* Oldest transaction of any kind (sent or received), from the first block of Base. */
   async function getFirstAny(addr, st) {
     if (st.firstAny) return;
     const d = await bsGet("/addresses/" + addr + "/transactions", { sort: "block_number", order: "asc" });
@@ -602,108 +655,217 @@
     }
   }
 
+  /* --- NFT mints (background) --- */
+  async function scanNfts(addr, onProgress, alive) {
+    let minted = 0, next = null, pages = 0, capped = false;
+    while (true) {
+      if (!alive()) return null;
+      const q = Object.assign({ type: "ERC-721,ERC-1155", filter: "to" }, next || {});
+      const d = await bsGet("/addresses/" + addr + "/token-transfers", q);
+      if (!d) break;
+      (d.items || []).forEach((t) => {
+        if (t.from && t.from.hash && t.from.hash.toLowerCase() === ZERO_ADDR &&
+            t.to && t.to.hash && t.to.hash.toLowerCase() === addr) minted++;
+      });
+      pages++;
+      onProgress(minted);
+      if (!d.next_page_params) break;
+      next = d.next_page_params;
+      if (pages >= MAX_PAGES_NFT) { capped = true; break; }
+      await sleep(PAGE_DELAY);
+    }
+    return { minted: minted, capped: capped };
+  }
+
+  /* --- view state and rendering --- */
+  const V = { addr: null };
+  let currentRun = 0;
+  const usdOf = (wei) => (V.price ? "~" + fmtUsd(weiToNum(wei) * V.price) : "");
+  const dateOf = (ms) => new Date(ms).toISOString().slice(0, 10);
+
+  function render() {
+    if (!V.addr) return;
+    const f = V.fast, s = V.slow;
+    const fastReady = !!(f && V.fastDone);
+    const slowOnly = !f && !!s;
+    const src = fastReady ? f : (slowOnly ? s : null);
+    const plus = slowOnly && !s.done ? "+" : "";
+    const cnt = src ? src.count : 0;
+
+    if (V.nonce !== null) $("sTx").textContent = String(Math.max(V.nonce, cnt));
+    else $("sTx").textContent = src ? cnt + plus : "...";
+
+    let gasTxt = "...", gasHint = "";
+    if (s && s.done) {
+      const w = toBig(s.fee);
+      gasTxt = fmtEth(w, 6);
+      gasHint = (usdOf(w) + " incl. L1 data fee").trim();
+    } else if (fastReady) {
+      const w = toBig(f.feeExec);
+      const pct = V.nonce && s ? Math.min(99, Math.floor((100 * s.count) / Math.max(V.nonce, 1))) : 0;
+      gasTxt = "~" + fmtEth(w, 6);
+      gasHint = (usdOf(w) + " execution fee, refining " + pct + "%").trim();
+    } else if (slowOnly) {
+      const w = toBig(s.fee);
+      gasTxt = fmtEth(w, 6) + "+";
+      gasHint = usdOf(w);
+    }
+    $("sGas").textContent = gasTxt;
+    $("sGasUsd").textContent = gasHint;
+
+    if (V.nftFailed) $("sNft").textContent = "n/a";
+    else if (V.nft === null) $("sNft").textContent = "...";
+    else $("sNft").textContent = V.nft + (V.nftDone ? (V.nftCapped ? "+" : "") : "...");
+
+    if (V.infoFailed) { $("sBal").textContent = "n/a"; $("sBalUsd").textContent = ""; }
+    else if (V.hasInfo) {
+      $("sBal").textContent = fmtEth(V.balWei, 4);
+      $("sBalUsd").textContent = V.price ? "Total holdings ~" + fmtUsd(weiToNum(V.balWei) * V.price + V.tokenUsd) : "";
+    } else { $("sBal").textContent = "..."; $("sBalUsd").textContent = ""; }
+
+    $("sDays").textContent = src ? src.days.length + plus : "...";
+    $("sContracts").textContent = src ? src.contracts.length + plus : "...";
+    const volWei = src ? toBig(src.vol) : 0n;
+    $("sVol").textContent = src ? fmtEth(volWei, 4) + plus : "...";
+    $("sVolUsd").textContent = src ? usdOf(volWei) : "";
+
+    if (!src) {
+      $("sFirst").textContent = "...";
+      $("sFirstAge").textContent = "";
+    } else {
+      let firstMs = null, sentMs = null;
+      const cand = [fastReady ? f.firstAny : null, fastReady ? f.firstSent : null, s ? s.firstAny : null, s ? s.firstSent : null];
+      cand.forEach((x) => { if (x && (firstMs === null || x < firstMs)) firstMs = x; });
+      sentMs = fastReady ? f.firstSent : (s ? s.firstSent : null);
+      if (firstMs === null) { $("sFirst").textContent = "-"; $("sFirstAge").textContent = ""; }
+      else {
+        $("sFirst").textContent = dateOf(firstMs);
+        let hint = Math.floor((Date.now() - firstMs) / 86400000) + " days ago";
+        if (sentMs !== null && Math.abs(sentMs - firstMs) > 86400000) hint += ", first sent: " + dateOf(sentMs);
+        $("sFirstAge").textContent = hint;
+      }
+    }
+
+    let note;
+    if (slowOnly && !s.done && !V.slowRunning) {
+      note = "Scanned " + s.count + " of ~" + (V.nonce || "?") + " sent transactions. Press Check again to continue.";
+    } else if (V.fastFailed) {
+      note = "The fast data source was unavailable, so the slower exact method was used.";
+    } else if (s && s.done) {
+      note = "All numbers cover every sent transaction on Base since its first block. USD values use the current ETH price.";
+    } else {
+      note = "Everything except gas fees is already exact. Gas fees are a quick estimate that becomes exact in the background.";
+    }
+    $("scoreNote").textContent = note;
+  }
+
+  async function loadInfo(addr, alive) {
+    try {
+      const info = await bsGet("/addresses/" + addr);
+      if (!alive()) return;
+      V.price = info && info.exchange_rate ? parseFloat(info.exchange_rate) || 0 : 0;
+      V.balWei = toBig(info && info.coin_balance);
+      V.hasInfo = true;
+      render();
+    } catch (e) {
+      console.error(e);
+      if (alive()) { V.infoFailed = true; render(); }
+      return;
+    }
+    try {
+      const tk = await bsGet("/addresses/" + addr + "/tokens", { type: "ERC-20" });
+      let usd = 0;
+      ((tk && tk.items) || []).forEach((it) => {
+        const t = it.token || {};
+        const rate = parseFloat(t.exchange_rate);
+        const dec = parseInt(t.decimals, 10);
+        if (rate && !isNaN(dec)) usd += (Number(it.value) / Math.pow(10, dec)) * rate;
+      });
+      if (alive()) { V.tokenUsd = usd; render(); }
+    } catch (e) { console.error(e); }
+  }
+
+  async function runFast(addr, alive) {
+    const fs = loadFast(addr) || newFast();
+    V.fast = fs;
+    try {
+      await fastScan(addr, fs, (n) => {
+        if (alive()) setWalletMsg("Reading transactions: " + n + "...", "pending");
+      }, alive);
+      if (alive()) { V.fastDone = true; render(); }
+    } catch (e) {
+      console.error(e);
+      if (!alive()) return;
+      V.fastFailed = true;
+      V.fast = null;
+      setWalletMsg("Fast source unavailable, using the slower method...", "pending");
+      const st = loadScore(addr) || newScore();
+      V.slow = st;
+      V.slowRunning = true;
+      await scanSent(addr, st, (n) => {
+        if (alive()) { setWalletMsg("Scanning sent transactions: " + n + (V.nonce ? " of ~" + V.nonce : "") + "...", "pending"); render(); }
+      }, alive);
+      V.slowRunning = false;
+      try { await getFirstAny(addr, st); saveScore(addr, st); } catch (e2) { console.error(e2); }
+      if (alive()) render();
+    }
+  }
+
+  function startBackground(addr, alive) {
+    if (!(V.slow && V.slow.done) && !V.slowRunning) {
+      const st = V.slow || loadScore(addr) || newScore();
+      V.slow = st;
+      V.slowRunning = true;
+      scanSent(addr, st, () => { if (alive()) render(); }, alive)
+        .catch((e) => console.error(e))
+        .then(() => { V.slowRunning = false; if (alive()) render(); });
+    }
+    scanNfts(addr, (n) => { if (alive()) { V.nft = n; render(); } }, alive)
+      .then((res) => {
+        if (!alive() || !res) return;
+        V.nft = res.minted; V.nftCapped = res.capped; V.nftDone = true; render();
+      })
+      .catch((e) => {
+        console.error(e);
+        if (alive()) { V.nftFailed = true; render(); }
+      });
+  }
+
   async function checkWallet() {
     const raw = $("walletInput").value.trim();
     if (!ethers.isAddress(raw)) { setWalletMsg("Enter a valid 0x wallet address.", "err"); return; }
     const addr = raw.toLowerCase();
+    const run = ++currentRun;
+    const alive = () => run === currentRun;
+
+    Object.keys(V).forEach((k) => delete V[k]);
+    Object.assign(V, {
+      addr: addr, price: 0, balWei: 0n, tokenUsd: 0, hasInfo: false, infoFailed: false,
+      nonce: null, fast: null, fastDone: false, fastFailed: false,
+      slow: null, slowRunning: false,
+      nft: null, nftDone: false, nftCapped: false, nftFailed: false
+    });
+
     $("scoreBtn").disabled = true;
-    $("scoreOut").style.display = "none";
+    $("scoreOut").style.display = "block";
+    $("scoreAddr").textContent = addr.slice(0, 8) + "..." + addr.slice(-6);
+    setWalletMsg("Loading...", "pending");
+    render();
+
+    const infoTask = loadInfo(addr, alive);
+    const nonceTask = getNonce(addr).then((n) => { if (alive()) { V.nonce = n; render(); } }).catch(console.error);
+    const fastTask = runFast(addr, alive);
+
     try {
-      setWalletMsg("Loading balance...", "pending");
-      const info = await bsGet("/addresses/" + addr);
-      const price = info && info.exchange_rate ? parseFloat(info.exchange_rate) || 0 : 0;
-      const balWei = toBig(info && info.coin_balance);
-
-      let tokenUsd = 0;
-      try {
-        const tk = await bsGet("/addresses/" + addr + "/tokens", { type: "ERC-20" });
-        ((tk && tk.items) || []).forEach((it) => {
-          const t = it.token || {};
-          const rate = parseFloat(t.exchange_rate);
-          const dec = parseInt(t.decimals, 10);
-          if (rate && !isNaN(dec)) tokenUsd += (Number(it.value) / Math.pow(10, dec)) * rate;
-        });
-      } catch (e) { console.error(e); }
-
-      setWalletMsg("Counting transactions...", "pending");
-      const nonce = await getNonce(addr);
-
-      const st = loadScore(addr) || newScore();
-      await scanSent(addr, st, (n) =>
-        setWalletMsg("Scanning sent transactions: " + n + (nonce ? " of ~" + nonce : "") + "...", "pending"));
-
-      setWalletMsg("Finding first transaction...", "pending");
-      try { await getFirstAny(addr, st); } catch (e) { console.error(e); }
-      saveScore(addr, st);
-
-      setWalletMsg("Checking NFTs...", "pending");
-      let nftRes;
-      try {
-        nftRes = await bsPages("/addresses/" + addr + "/token-transfers",
-          { type: "ERC-721,ERC-1155", filter: "to" }, MAX_PAGES_NFT,
-          (n) => setWalletMsg("Checking NFTs: " + n + "...", "pending"));
-      } catch (e) {
-        console.error(e);
-        nftRes = { items: [], capped: true, failed: true };
-      }
-      const minted = nftRes.items.filter((t) =>
-        t.from && t.from.hash && t.from.hash.toLowerCase() === ZERO_ADDR &&
-        t.to && t.to.hash && t.to.hash.toLowerCase() === addr).length;
-
-      const partial = !st.done;
-      const plus = partial ? "+" : "";
-      const feeWei = toBig(st.fee);
-      const volWei = toBig(st.vol);
-
-      let total;
-      if (st.count === 0 && nonce === 0) total = "0";
-      else if (nonce !== null) total = String(Math.max(nonce, st.count));
-      else total = st.count + plus;
-
-      let firstMs = null;
-      if (st.firstAny !== null) firstMs = st.firstAny;
-      if (st.firstSent !== null && (firstMs === null || st.firstSent < firstMs)) firstMs = st.firstSent;
-
-      $("scoreAddr").textContent = addr.slice(0, 8) + "..." + addr.slice(-6);
-      $("sTx").textContent = total;
-      $("sGas").textContent = fmtEth(feeWei, 6) + plus;
-      $("sGasUsd").textContent = price ? "~" + fmtUsd(weiToNum(feeWei) * price) : "";
-      $("sNft").textContent = nftRes.failed ? "n/a" : minted + (nftRes.capped ? "+" : "");
-      $("sBal").textContent = fmtEth(balWei, 4);
-      const totalUsd = weiToNum(balWei) * price + tokenUsd;
-      $("sBalUsd").textContent = price ? "Total holdings ~" + fmtUsd(totalUsd) : "";
-      $("sDays").textContent = st.days.length + plus;
-      $("sContracts").textContent = st.contracts.length + plus;
-      if (firstMs !== null) {
-        $("sFirst").textContent = new Date(firstMs).toISOString().slice(0, 10);
-        const age = Math.floor((Date.now() - firstMs) / 86400000);
-        let hint = age + " days ago";
-        if (st.firstSent !== null && Math.abs(st.firstSent - firstMs) > 86400000) {
-          hint += ", first sent: " + new Date(st.firstSent).toISOString().slice(0, 10);
-        }
-        $("sFirstAge").textContent = hint;
-      } else {
-        $("sFirst").textContent = "-";
-        $("sFirstAge").textContent = "";
-      }
-      $("sVol").textContent = fmtEth(volWei, 4) + plus;
-      $("sVolUsd").textContent = price ? "~" + fmtUsd(weiToNum(volWei) * price) : "";
-
-      let note;
-      if (st.stopped) {
-        note = "The connection was interrupted after " + st.count + " of ~" + (nonce || "?") + " sent transactions. Showing results so far. Check your VPN, then press Check again to continue.";
-      } else if (partial) {
-        note = "Scanned " + st.count + " of ~" + (nonce || "?") + " sent transactions. Press Check again to continue. Total Transactions and First Transaction are already exact.";
-      } else {
-        note = "Based on all sent transactions on Base since the first block. USD values use the current ETH price.";
-      }
-      $("scoreNote").textContent = note;
-      setWalletMsg("");
-      $("scoreOut").style.display = "block";
+      await Promise.all([infoTask, nonceTask, fastTask]);
     } catch (err) {
-      setWalletMsg("Failed: " + (err.message || "unknown error"), "err");
+      if (alive()) setWalletMsg("Failed: " + (err.message || "unknown error"), "err");
     }
+    if (!alive()) return;
+    if ($("walletMsg").className !== "err") setWalletMsg("");
     $("scoreBtn").disabled = false;
+    render();
+    startBackground(addr, alive);
   }
 
   $("connectBtn").onclick = connect;
