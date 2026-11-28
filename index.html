@@ -22,11 +22,13 @@
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .stat { text-align: center; }
   .num { font-size: 30px; font-weight: bold; color: #0052ff; }
+  .num.sm { font-size: 20px; word-break: break-word; }
   .label { font-size: 13px; color: #4a5878; }
-  #status { min-height: 22px; text-align: center; word-break: break-all; font-size: 14px; }
-  #status.ok { color: #16a34a; }
-  #status.pending { color: #d97706; }
-  #status.err { color: #dc2626; }
+  .hint { font-size: 12px; color: #4a5878; margin-top: 2px; }
+  #status, #walletMsg { min-height: 22px; text-align: center; word-break: break-all; font-size: 14px; }
+  #status.ok, #walletMsg.ok { color: #16a34a; }
+  #status.pending, #walletMsg.pending { color: #d97706; }
+  #status.err, #walletMsg.err { color: #dc2626; }
   a { color: #0041cc; }
   .row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #c9d8f7; font-size: 15px; }
   .row:last-child { border-bottom: none; }
@@ -37,6 +39,11 @@
   .modal-card h2 { margin: 0 0 14px; font-size: 18px; color: #0f172a; }
   .wallet-btn { display: flex; align-items: center; gap: 12px; width: 100%; margin-bottom: 8px; padding: 12px 14px; font-size: 16px; text-align: left; background: #ffffff; color: #0f172a; border: 1px solid #c9d8f7; }
   .wallet-btn img { width: 28px; height: 28px; border-radius: 6px; }
+  .search-row { display: flex; gap: 8px; }
+  .search-row input { flex: 1; min-width: 0; padding: 12px; font-size: 14px; border: 1px solid #c9d8f7; border-radius: 10px; color: #0f172a; background: #ffffff; }
+  .search-row button { padding: 12px 18px; font-size: 15px; }
+  #scoreOut { margin-top: 16px; }
+  #scoreOut .grid { gap: 16px 12px; }
 </style>
 </head>
 <body>
@@ -57,6 +64,30 @@
       <div class="stat"><div class="num" id="myGn">-</div><div class="label">Your GN</div></div>
     </div>
     <div id="status" style="margin-top:14px;"></div>
+  </div>
+
+  <div class="card">
+    <h2>Activity score</h2>
+    <div class="search-row">
+      <input id="walletInput" type="text" placeholder="Paste a wallet address (0x...)" autocomplete="off" spellcheck="false">
+      <button id="scoreBtn">Check</button>
+    </div>
+    <div class="center"><button id="useMine" class="secondary">Use my connected wallet</button></div>
+    <div id="walletMsg" style="margin-top:10px;"></div>
+    <div id="scoreOut" style="display:none;">
+      <div id="scoreAddr" class="muted" style="margin-bottom:14px;"></div>
+      <div class="grid">
+        <div class="stat"><div class="num sm" id="sTx">-</div><div class="label">Total Transactions</div></div>
+        <div class="stat"><div class="num sm" id="sGas">-</div><div class="label">Gas fees paid</div><div class="hint" id="sGasUsd"></div></div>
+        <div class="stat"><div class="num sm" id="sNft">-</div><div class="label">NFTs minted</div></div>
+        <div class="stat"><div class="num sm" id="sBal">-</div><div class="label">Balance on Base</div><div class="hint" id="sBalUsd"></div></div>
+        <div class="stat"><div class="num sm" id="sDays">-</div><div class="label">Active days</div></div>
+        <div class="stat"><div class="num sm" id="sContracts">-</div><div class="label">Unique contracts</div></div>
+        <div class="stat"><div class="num sm" id="sFirst">-</div><div class="label">First Transaction</div><div class="hint" id="sFirstAge"></div></div>
+        <div class="stat"><div class="num sm" id="sVol">-</div><div class="label">Total Volume (ETH sent)</div><div class="hint" id="sVolUsd"></div></div>
+      </div>
+      <div class="hint center" id="scoreNote" style="margin-top:16px;"></div>
+    </div>
   </div>
 
   <div class="card">
@@ -159,7 +190,7 @@
   }
   function closeModal() { $("modal").style.display = "none"; }
 
-  /* ---------- stats ---------- */
+  /* ---------- GM/GN stats ---------- */
   let statsData = { lastBlock: null, gmTotal: 0, gnTotal: 0, gmMap: {}, users: {} };
   let statsRunning = false;
 
@@ -398,12 +429,255 @@
     }
   }
 
+  /* ---------- wallet activity score (Blockscout API) ---------- */
+  const BS = "https://base.blockscout.com/api/v2";
+  const MAX_RUN_PAGES = 300;
+  const MAX_PAGES_NFT = 60;
+  const PAGE_DELAY = 100;
+  const SCORE_KEY = "gmgn_score_v1_";
+  const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const setWalletMsg = (msg, cls) => { $("walletMsg").textContent = msg; $("walletMsg").className = cls || ""; };
+
+  async function bsGet(path, params) {
+    const url = new URL(BS + path);
+    Object.keys(params || {}).forEach((k) => url.searchParams.set(k, params[k]));
+    for (let i = 0; i < 5; i++) {
+      const r = await fetch(url.toString());
+      if (r.status === 404) return null;
+      if (r.status === 429) { await sleep(1500 * (i + 1)); continue; }
+      if (!r.ok) throw new Error("API error " + r.status);
+      return r.json();
+    }
+    throw new Error("Too many requests. Please try again in a minute.");
+  }
+
+  async function bsPages(path, params, maxPages, onProgress) {
+    let items = [];
+    let next = null;
+    for (let p = 0; p < maxPages; p++) {
+      const q = Object.assign({}, params, next || {});
+      const d = await bsGet(path, q);
+      if (!d) return { items: items, capped: false };
+      items = items.concat(d.items || []);
+      if (onProgress) onProgress(items.length);
+      if (!d.next_page_params) return { items: items, capped: false };
+      next = d.next_page_params;
+      await sleep(PAGE_DELAY);
+    }
+    return { items: items, capped: true };
+  }
+
+  async function getNonce(addr) {
+    for (const rpc of RPCS) {
+      try {
+        const p = new ethers.JsonRpcProvider(rpc);
+        return await p.getTransactionCount(addr);
+      } catch (e) { console.error(rpc, e); }
+    }
+    return null;
+  }
+
+  const toBig = (x) => { try { return BigInt(x || "0"); } catch (e) { return 0n; } };
+  const weiToNum = (wei) => Number(ethers.formatEther(wei));
+  const fmtEth = (wei, digits) => {
+    const n = weiToNum(wei);
+    if (n === 0) return "0 ETH";
+    if (n < Math.pow(10, -digits)) return "<" + Math.pow(10, -digits).toFixed(digits) + " ETH";
+    return n.toFixed(digits) + " ETH";
+  };
+  const fmtUsd = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  function newScore() {
+    return { cursor: null, lastCur: null, done: false, markB: -1, markP: -1, count: 0, fee: "0", vol: "0", days: [], contracts: [], firstSent: null, firstAny: null };
+  }
+  function loadScore(addr) {
+    try {
+      const raw = localStorage.getItem(SCORE_KEY + addr);
+      if (raw) return JSON.parse(raw);
+    } catch (e) {}
+    return null;
+  }
+  function saveScore(addr, st) {
+    try { localStorage.setItem(SCORE_KEY + addr, JSON.stringify(st)); } catch (e) {}
+  }
+
+  /* Scans sent transactions from oldest to newest and keeps running totals.
+     The state is saved, so a repeat check only reads new transactions,
+     and a very large wallet can be continued by pressing Check again. */
+  async function scanSent(addr, st, onProgress) {
+    const days = new Set(st.days);
+    const cons = new Set(st.contracts);
+    let fee = toBig(st.fee);
+    let vol = toBig(st.vol);
+    let cur = st.done ? st.lastCur : st.cursor;
+    st.done = false;
+    let pages = 0;
+
+    const commit = () => {
+      st.fee = fee.toString();
+      st.vol = vol.toString();
+      st.days = Array.from(days);
+      st.contracts = Array.from(cons);
+      saveScore(addr, st);
+    };
+
+    while (true) {
+      const q = Object.assign({ filter: "from", sort: "block_number", order: "asc" }, cur || {});
+      const d = await bsGet("/addresses/" + addr + "/transactions", q);
+      if (!d) { st.done = true; st.cursor = null; break; }
+
+      const mb0 = st.markB, mp0 = st.markP;
+      let nb = mb0, np = mp0;
+      (d.items || []).forEach((t) => {
+        if (!t.from || !t.from.hash || t.from.hash.toLowerCase() !== addr) return;
+        const b = t.block_number, p = t.position || 0;
+        if (b < mb0 || (b === mb0 && p <= mp0)) return;
+        st.count++;
+        fee += toBig(t.fee && t.fee.value);
+        if (t.status === "ok") vol += toBig(t.value);
+        if (t.timestamp) {
+          const ms = Date.parse(t.timestamp);
+          days.add(t.timestamp.slice(0, 10));
+          if (st.firstSent === null || ms < st.firstSent) st.firstSent = ms;
+        }
+        if (t.to && t.to.hash && t.to.is_contract) cons.add(t.to.hash.toLowerCase());
+        if (b > nb || (b === nb && p > np)) { nb = b; np = p; }
+      });
+      st.markB = nb;
+      st.markP = np;
+      st.lastCur = cur;
+      pages++;
+      onProgress(st.count);
+
+      if (!d.next_page_params) { st.done = true; st.cursor = null; break; }
+      cur = d.next_page_params;
+      st.cursor = cur;
+      if (pages >= MAX_RUN_PAGES) break;
+      if (pages % 5 === 0) commit();
+      await sleep(PAGE_DELAY);
+    }
+    commit();
+  }
+
+  /* Oldest transaction of any kind (sent or received), from the first block of Base. */
+  async function getFirstAny(addr, st) {
+    if (st.firstAny) return;
+    const d = await bsGet("/addresses/" + addr + "/transactions", { sort: "block_number", order: "asc" });
+    if (d && d.items && d.items.length) {
+      let min = null;
+      d.items.forEach((t) => {
+        if (!t.timestamp) return;
+        const ms = Date.parse(t.timestamp);
+        if (min === null || ms < min) min = ms;
+      });
+      if (min !== null) st.firstAny = min;
+    }
+  }
+
+  async function checkWallet() {
+    const raw = $("walletInput").value.trim();
+    if (!ethers.isAddress(raw)) { setWalletMsg("Enter a valid 0x wallet address.", "err"); return; }
+    const addr = raw.toLowerCase();
+    $("scoreBtn").disabled = true;
+    $("scoreOut").style.display = "none";
+    try {
+      setWalletMsg("Loading balance...", "pending");
+      const info = await bsGet("/addresses/" + addr);
+      const price = info && info.exchange_rate ? parseFloat(info.exchange_rate) || 0 : 0;
+      const balWei = toBig(info && info.coin_balance);
+
+      let tokenUsd = 0;
+      try {
+        const tk = await bsGet("/addresses/" + addr + "/tokens", { type: "ERC-20" });
+        ((tk && tk.items) || []).forEach((it) => {
+          const t = it.token || {};
+          const rate = parseFloat(t.exchange_rate);
+          const dec = parseInt(t.decimals, 10);
+          if (rate && !isNaN(dec)) tokenUsd += (Number(it.value) / Math.pow(10, dec)) * rate;
+        });
+      } catch (e) { console.error(e); }
+
+      setWalletMsg("Counting transactions...", "pending");
+      const nonce = await getNonce(addr);
+
+      const st = loadScore(addr) || newScore();
+      await scanSent(addr, st, (n) =>
+        setWalletMsg("Scanning sent transactions: " + n + (nonce ? " of ~" + nonce : "") + "...", "pending"));
+
+      setWalletMsg("Finding first transaction...", "pending");
+      await getFirstAny(addr, st);
+      saveScore(addr, st);
+
+      const nftRes = await bsPages("/addresses/" + addr + "/token-transfers",
+        { type: "ERC-721,ERC-1155", filter: "to" }, MAX_PAGES_NFT,
+        (n) => setWalletMsg("Checking NFTs: " + n + "...", "pending"));
+      const minted = nftRes.items.filter((t) =>
+        t.from && t.from.hash && t.from.hash.toLowerCase() === ZERO_ADDR &&
+        t.to && t.to.hash && t.to.hash.toLowerCase() === addr).length;
+
+      const partial = !st.done;
+      const plus = partial ? "+" : "";
+      const feeWei = toBig(st.fee);
+      const volWei = toBig(st.vol);
+
+      let total;
+      if (st.count === 0 && nonce === 0) total = "0";
+      else if (nonce !== null) total = String(Math.max(nonce, st.count));
+      else total = st.count + plus;
+
+      let firstMs = null;
+      if (st.firstAny !== null) firstMs = st.firstAny;
+      if (st.firstSent !== null && (firstMs === null || st.firstSent < firstMs)) firstMs = st.firstSent;
+
+      $("scoreAddr").textContent = addr.slice(0, 8) + "..." + addr.slice(-6);
+      $("sTx").textContent = total;
+      $("sGas").textContent = fmtEth(feeWei, 6) + plus;
+      $("sGasUsd").textContent = price ? "~" + fmtUsd(weiToNum(feeWei) * price) : "";
+      $("sNft").textContent = minted + (nftRes.capped ? "+" : "");
+      $("sBal").textContent = fmtEth(balWei, 4);
+      const totalUsd = weiToNum(balWei) * price + tokenUsd;
+      $("sBalUsd").textContent = price ? "Total holdings ~" + fmtUsd(totalUsd) : "";
+      $("sDays").textContent = st.days.length + plus;
+      $("sContracts").textContent = st.contracts.length + plus;
+      if (firstMs !== null) {
+        $("sFirst").textContent = new Date(firstMs).toISOString().slice(0, 10);
+        const age = Math.floor((Date.now() - firstMs) / 86400000);
+        let hint = age + " days ago";
+        if (st.firstSent !== null && Math.abs(st.firstSent - firstMs) > 86400000) {
+          hint += ", first sent: " + new Date(st.firstSent).toISOString().slice(0, 10);
+        }
+        $("sFirstAge").textContent = hint;
+      } else {
+        $("sFirst").textContent = "-";
+        $("sFirstAge").textContent = "";
+      }
+      $("sVol").textContent = fmtEth(volWei, 4) + plus;
+      $("sVolUsd").textContent = price ? "~" + fmtUsd(weiToNum(volWei) * price) : "";
+      $("scoreNote").textContent = partial
+        ? "Scanned " + st.count + " of ~" + (nonce || "?") + " sent transactions. Press Check again to continue. Total Transactions and First Transaction are already exact."
+        : "Based on all sent transactions on Base since the first block. USD values use the current ETH price.";
+      setWalletMsg("");
+      $("scoreOut").style.display = "block";
+    } catch (err) {
+      setWalletMsg("Failed: " + (err.message || "unknown error"), "err");
+    }
+    $("scoreBtn").disabled = false;
+  }
+
   $("connectBtn").onclick = connect;
   $("disconnectBtn").onclick = disconnectWallet;
   $("closeModal").onclick = closeModal;
   $("modal").onclick = (e) => { if (e.target === $("modal")) closeModal(); };
   $("gmBtn").onclick = () => send("sayGM");
   $("gnBtn").onclick = () => send("sayGN");
+  $("scoreBtn").onclick = checkWallet;
+  $("walletInput").addEventListener("keydown", (e) => { if (e.key === "Enter") checkWallet(); });
+  $("useMine").onclick = () => {
+    if (!userAddress) { setWalletMsg("Connect a wallet first.", "err"); return; }
+    $("walletInput").value = userAddress;
+    checkWallet();
+  };
 
   loadStats();
   autoConnect();
