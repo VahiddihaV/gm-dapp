@@ -431,25 +431,43 @@
 
   /* ---------- wallet activity score (Blockscout API) ---------- */
   const BS = "https://base.blockscout.com/api/v2";
-  const MAX_RUN_PAGES = 300;
-  const MAX_PAGES_NFT = 60;
-  const PAGE_DELAY = 100;
+  const MAX_RUN_PAGES = 120;
+  const MAX_PAGES_NFT = 40;
+  const PAGE_DELAY = 300;
+  const REQ_TIMEOUT = 25000;
   const SCORE_KEY = "gmgn_score_v1_";
   const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const setWalletMsg = (msg, cls) => { $("walletMsg").textContent = msg; $("walletMsg").className = cls || ""; };
 
+  /* Every request has a timeout and up to 6 retries with growing pauses. */
   async function bsGet(path, params) {
     const url = new URL(BS + path);
     Object.keys(params || {}).forEach((k) => url.searchParams.set(k, params[k]));
-    for (let i = 0; i < 5; i++) {
-      const r = await fetch(url.toString());
-      if (r.status === 404) return null;
-      if (r.status === 429) { await sleep(1500 * (i + 1)); continue; }
-      if (!r.ok) throw new Error("API error " + r.status);
-      return r.json();
+    let lastErr = null;
+    for (let i = 0; i < 6; i++) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), REQ_TIMEOUT);
+      try {
+        const r = await fetch(url.toString(), { signal: ctrl.signal });
+        clearTimeout(timer);
+        if (r.status === 404) return null;
+        if (r.status === 429 || r.status >= 500) {
+          lastErr = new Error("API busy (" + r.status + ")");
+        } else if (!r.ok) {
+          throw new Error("API error " + r.status);
+        } else {
+          return await r.json();
+        }
+      } catch (e) {
+        clearTimeout(timer);
+        if (e && e.message && e.message.indexOf("API error") === 0) throw e;
+        lastErr = e;
+      }
+      setWalletMsg("Connection slow, retrying (" + (i + 1) + "/6)...", "pending");
+      await sleep(Math.min(2000 * (i + 1), 10000));
     }
-    throw new Error("Too many requests. Please try again in a minute.");
+    throw new Error("Could not reach the data source (" + (lastErr && lastErr.message ? lastErr.message : "network error") + "). Check your VPN or internet and press Check again.");
   }
 
   async function bsPages(path, params, maxPages, onProgress) {
@@ -489,7 +507,7 @@
   const fmtUsd = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
   function newScore() {
-    return { cursor: null, lastCur: null, done: false, markB: -1, markP: -1, count: 0, fee: "0", vol: "0", days: [], contracts: [], firstSent: null, firstAny: null };
+    return { cursor: null, lastCur: null, done: false, stopped: false, markB: -1, markP: -1, count: 0, fee: "0", vol: "0", days: [], contracts: [], firstSent: null, firstAny: null };
   }
   function loadScore(addr) {
     try {
@@ -503,8 +521,8 @@
   }
 
   /* Scans sent transactions from oldest to newest and keeps running totals.
-     The state is saved, so a repeat check only reads new transactions,
-     and a very large wallet can be continued by pressing Check again. */
+     Progress is saved, so a repeat check only reads new transactions,
+     and an interrupted or very large scan continues where it stopped. */
   async function scanSent(addr, st, onProgress) {
     const days = new Set(st.days);
     const cons = new Set(st.contracts);
@@ -512,6 +530,7 @@
     let vol = toBig(st.vol);
     let cur = st.done ? st.lastCur : st.cursor;
     st.done = false;
+    st.stopped = false;
     let pages = 0;
 
     const commit = () => {
@@ -524,7 +543,15 @@
 
     while (true) {
       const q = Object.assign({ filter: "from", sort: "block_number", order: "asc" }, cur || {});
-      const d = await bsGet("/addresses/" + addr + "/transactions", q);
+      let d;
+      try {
+        d = await bsGet("/addresses/" + addr + "/transactions", q);
+      } catch (e) {
+        console.error(e);
+        st.stopped = true;
+        commit();
+        return;
+      }
       if (!d) { st.done = true; st.cursor = null; break; }
 
       const mb0 = st.markB, mp0 = st.markP;
@@ -606,12 +633,19 @@
         setWalletMsg("Scanning sent transactions: " + n + (nonce ? " of ~" + nonce : "") + "...", "pending"));
 
       setWalletMsg("Finding first transaction...", "pending");
-      await getFirstAny(addr, st);
+      try { await getFirstAny(addr, st); } catch (e) { console.error(e); }
       saveScore(addr, st);
 
-      const nftRes = await bsPages("/addresses/" + addr + "/token-transfers",
-        { type: "ERC-721,ERC-1155", filter: "to" }, MAX_PAGES_NFT,
-        (n) => setWalletMsg("Checking NFTs: " + n + "...", "pending"));
+      setWalletMsg("Checking NFTs...", "pending");
+      let nftRes;
+      try {
+        nftRes = await bsPages("/addresses/" + addr + "/token-transfers",
+          { type: "ERC-721,ERC-1155", filter: "to" }, MAX_PAGES_NFT,
+          (n) => setWalletMsg("Checking NFTs: " + n + "...", "pending"));
+      } catch (e) {
+        console.error(e);
+        nftRes = { items: [], capped: true, failed: true };
+      }
       const minted = nftRes.items.filter((t) =>
         t.from && t.from.hash && t.from.hash.toLowerCase() === ZERO_ADDR &&
         t.to && t.to.hash && t.to.hash.toLowerCase() === addr).length;
@@ -634,7 +668,7 @@
       $("sTx").textContent = total;
       $("sGas").textContent = fmtEth(feeWei, 6) + plus;
       $("sGasUsd").textContent = price ? "~" + fmtUsd(weiToNum(feeWei) * price) : "";
-      $("sNft").textContent = minted + (nftRes.capped ? "+" : "");
+      $("sNft").textContent = nftRes.failed ? "n/a" : minted + (nftRes.capped ? "+" : "");
       $("sBal").textContent = fmtEth(balWei, 4);
       const totalUsd = weiToNum(balWei) * price + tokenUsd;
       $("sBalUsd").textContent = price ? "Total holdings ~" + fmtUsd(totalUsd) : "";
@@ -654,9 +688,16 @@
       }
       $("sVol").textContent = fmtEth(volWei, 4) + plus;
       $("sVolUsd").textContent = price ? "~" + fmtUsd(weiToNum(volWei) * price) : "";
-      $("scoreNote").textContent = partial
-        ? "Scanned " + st.count + " of ~" + (nonce || "?") + " sent transactions. Press Check again to continue. Total Transactions and First Transaction are already exact."
-        : "Based on all sent transactions on Base since the first block. USD values use the current ETH price.";
+
+      let note;
+      if (st.stopped) {
+        note = "The connection was interrupted after " + st.count + " of ~" + (nonce || "?") + " sent transactions. Showing results so far. Check your VPN, then press Check again to continue.";
+      } else if (partial) {
+        note = "Scanned " + st.count + " of ~" + (nonce || "?") + " sent transactions. Press Check again to continue. Total Transactions and First Transaction are already exact.";
+      } else {
+        note = "Based on all sent transactions on Base since the first block. USD values use the current ETH price.";
+      }
+      $("scoreNote").textContent = note;
       setWalletMsg("");
       $("scoreOut").style.display = "block";
     } catch (err) {
